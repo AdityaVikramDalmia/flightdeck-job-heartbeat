@@ -1,11 +1,16 @@
 # Job Heartbeat
 
+> **Deprecated for new Claude Code integrations — 2026-09-22.** Retained as an
+> Apache-2.0 reference project. Public launch remains deferred and the repository
+> remains private. This is a maintainer status decision, not a claim that Claude
+> Code replaces every capability. No ongoing feature work or support is promised.
+
 A cooperative heartbeat and completion marker for shell jobs. A job reports its
 progress; observers see whether the last report is fresh, late, or terminal.
 Restarting a name creates a new generation, so an old worker cannot overwrite the
 new run.
 
-**Private candidate: 0.1.0rc1; redistribution license pending.** Requires Python
+**Private candidate: 0.1.0rc1; Apache-2.0 licensed; public launch deferred.** Requires Python
 3.9+ on macOS or Linux with local advisory `flock`. No packages, account, network,
 model, daemon, or process discovery are involved. Windows is unsupported.
 
@@ -51,3 +56,10 @@ The suite has been executed on macOS and in an unprivileged Alpine Linux
 container with Python 3.14. See [documentation](docs/README.md)
 for the CLI, schema, failure handling, and trust boundaries, and
 [provenance](PROVENANCE.md) for the adaptation.
+
+## License and maintenance
+
+Copyright 2026 Aditya Dalmia. Licensed under [Apache-2.0](LICENSE), with
+[attribution](NOTICE) and [source provenance](PROVENANCE.md). Public launch is
+deferred; repository access remains private. See the [release preparation index](docs/release/README.md),
+[contributing guide](CONTRIBUTING.md), and [security contact](SECURITY.md).

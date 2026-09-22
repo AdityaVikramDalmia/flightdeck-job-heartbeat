@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Deprecated reference example for new Claude Code integrations (2026-09-22).
 set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 HEARTBEAT="$ROOT/bin/job-heartbeat"

@@ -15,5 +15,4 @@ watcher rosters, automatic nudges, and environment-specific paths were omitted.
 Tests and examples use only newly generated synthetic state. No private runtime
 state or service credentials are included.
 
-Private candidate; redistribution license pending. The owner must choose licensing
-and publication terms before wider distribution.
+Private candidate; Apache-2.0 licensed; public launch deferred. The owner selected Apache-2.0 on 2026-09-22; public launch remains deferred.
