@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+"""Cooperative job heartbeat records. Local state only; no process discovery."""
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import signal
+import stat
+import sys
+import time
+import uuid
+
+VERSION = "0.1.0rc1"
+NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
+GENERATION = re.compile(r"[0-9a-f]{32}\Z")
+FILE = re.compile(r"[0-9a-f]{64}\.json\Z")
+OUTCOMES = ("succeeded", "failed", "cancelled")
+KEYS = {"schema_version", "job", "generation", "state", "started_at", "updated_at", "ttl_seconds", "revision", "outcome", "note"}
+
+
+class Refused(Exception):
+    pass
+
+
+class Busy(Exception):
+    pass
+
+
+def number(value):
+    try:
+        return type(value) in (int, float) and math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def positive(value):
+    result = float(value)
+    if not math.isfinite(result) or result <= 0:
+        raise argparse.ArgumentTypeError("must be finite and greater than zero")
+    return result
+
+
+def nonnegative(value):
+    result = float(value)
+    if not math.isfinite(result) or result < 0:
+        raise argparse.ArgumentTypeError("must be finite and nonnegative")
+    return result
+
+
+def job_name(value):
+    if not NAME.fullmatch(value):
+        raise argparse.ArgumentTypeError("job must be 1-128 ASCII letters, digits, dots, underscores or hyphens, beginning with a letter or digit")
+    return value
+
+
+def generation(value):
+    if not GENERATION.fullmatch(value):
+        raise argparse.ArgumentTypeError("generation must be 32 lowercase hexadecimal characters")
+    return value
+
+
+def note(value):
+    if len(value.encode("utf-8")) > 4096:
+        raise argparse.ArgumentTypeError("note must fit within 4096 UTF-8 bytes")
+    return value
+
+
+def filename(job):
+    return hashlib.sha256(job.encode("ascii")).hexdigest() + ".json"
+
+
+def validate(row, expected_file):
+    if not isinstance(row, dict) or set(row) != KEYS:
+        raise ValueError("invalid record fields")
+    if type(row["schema_version"]) is not int or row["schema_version"] != 1:
+        raise ValueError("unsupported schema version")
+    if not isinstance(row["job"], str) or not NAME.fullmatch(row["job"]) or filename(row["job"]) != expected_file:
+        raise ValueError("job identity does not match storage path")
+    if not isinstance(row["generation"], str) or not GENERATION.fullmatch(row["generation"]):
+        raise ValueError("invalid generation")
+    if row["state"] not in ("running", "finished"):
+        raise ValueError("invalid lifecycle state")
+    for key in ("started_at", "updated_at", "ttl_seconds"):
+        if not number(row[key]) or row[key] < 0:
+            raise ValueError("invalid " + key)
+    if row["ttl_seconds"] <= 0 or row["updated_at"] < row["started_at"]:
+        raise ValueError("invalid timestamp order or TTL")
+    if type(row["revision"]) is not int or row["revision"] < 1:
+        raise ValueError("invalid revision")
+    if not isinstance(row["note"], str) or len(row["note"].encode("utf-8")) > 4096:
+        raise ValueError("invalid note")
+    if (row["state"] == "running" and row["outcome"] is not None) or (row["state"] == "finished" and row["outcome"] not in OUTCOMES):
+        raise ValueError("invalid outcome")
+    return row
+
+
+@contextlib.contextmanager
+def store(path, timeout, create):
+    if create:
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        directory = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        if create:
+            raise
+        yield None
+        return
+    try:
+        descriptor = os.open(".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=directory)
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise ValueError("lock must be a regular, singly linked file")
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise Busy("storage lock timed out; no operation performed")
+                    time.sleep(min(0.02, max(0, deadline - time.monotonic())))
+            current = os.stat(".lock", dir_fd=directory, follow_symlinks=False)
+            if (current.st_dev, current.st_ino, current.st_nlink) != (metadata.st_dev, metadata.st_ino, 1):
+                raise ValueError("lock path changed while waiting")
+            yield directory
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(directory)
+
+
+def duplicate_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def load(directory, name):
+    if directory is None:
+        return None
+    try:
+        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+    except FileNotFoundError:
+        return None
+    with os.fdopen(descriptor, "rb") as source:
+        metadata = os.fstat(source.fileno())
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise ValueError("record must be a regular, singly linked file")
+        content = source.read(65537)
+        if len(content) > 65536:
+            raise ValueError("record exceeds 64 KiB")
+    return validate(json.loads(content, object_pairs_hook=duplicate_keys), name)
+
+
+def publish(directory, name, row):
+    validate(row, name)
+    temporary = ".pending." + uuid.uuid4().hex
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=directory)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            json.dump(row, output, ensure_ascii=True, allow_nan=False, sort_keys=True)
+            output.write("\n")
+        os.replace(temporary, name, src_dir_fd=directory, dst_dir_fd=directory)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary, dir_fd=directory)
+
+
+def report(job, row, now, reason=None):
+    result = {"job": job, "status": "missing", "age_seconds": None, "reason": reason, "record": row}
+    if reason:
+        result["status"] = "unknown"
+    elif row:
+        age = now - row["updated_at"]
+        result["age_seconds"] = age
+        if age < 0:
+            result.update(status="unknown", reason="record timestamp is in the future; wall clock moved or state was edited")
+        elif row["state"] == "finished":
+            result["status"] = "finished"
+        else:
+            result["status"] = "fresh" if age <= row["ttl_seconds"] else "late"
+    return result
+
+
+def read_report(directory, name, job, now):
+    try:
+        row = load(directory, name)
+        return report(row["job"] if row else job, row, now)
+    except (OSError, ValueError, UnicodeError, RecursionError) as exc:
+        return report(job, None, now, str(exc))
+
+
+def operate(args):
+    write = args.command in ("start", "touch", "finish")
+    with store(Path(args.directory), args.lock_timeout, write) as directory:
+        now = time.time()
+        if args.command == "list":
+            names = sorted(name for name in os.listdir(directory) if name.endswith(".json")) if directory is not None else []
+            rows = []
+            for name in names:
+                if not FILE.fullmatch(name):
+                    rows.append(report(None, None, now, "unexpected record filename: " + name))
+                else:
+                    rows.append(dict(read_report(directory, name, None, now), storage_file=name))
+            return rows, int(any(row["status"] == "unknown" for row in rows))
+        name = filename(args.job)
+        if args.command == "read":
+            row = read_report(directory, name, args.job, now)
+            return row, int(row["status"] == "unknown")
+        old = load(directory, name)
+        if old and now < old["updated_at"]:
+            raise ValueError("record timestamp is in the future; refusing mutation")
+        if args.command == "start":
+            if old is not None and args.replace != old["generation"]:
+                raise Refused("job already exists; restart requires --replace with its current generation")
+            if old is None and args.replace is not None:
+                raise Refused("cannot replace a missing generation")
+            row = dict(schema_version=1, job=args.job, generation=uuid.uuid4().hex, state="running",
+                       started_at=now, updated_at=now, ttl_seconds=args.ttl, revision=1, outcome=None, note=args.note)
+        else:
+            if old is None:
+                raise Refused("job is missing; start it explicitly")
+            if old["generation"] != args.generation:
+                raise Refused("generation mismatch; stale writer refused")
+            if old["state"] == "finished":
+                if args.command == "finish" and args.outcome == old["outcome"]:
+                    return report(args.job, old, now), 0
+                raise Refused("generation is terminal; start a new generation explicitly")
+            row = dict(old, updated_at=now, revision=old["revision"] + 1)
+            if args.note is not None:
+                row["note"] = args.note
+            if args.command == "finish":
+                row.update(state="finished", outcome=args.outcome)
+        publish(directory, name, row)
+        return report(args.job, row, now), 0
+
+
+def interrupted(signum, frame):
+    raise InterruptedError("interrupted by signal " + str(signum))
+
+
+def discard_failed_stream(stream):
+    # Prevent a second buffered flush at interpreter shutdown from changing exit
+    # status to 120 after an already-handled I/O failure.
+    if stream is None:
+        return
+    try:
+        descriptor = stream.fileno()
+        sink = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(sink, descriptor)
+        finally:
+            if sink != descriptor:
+                os.close(sink)
+        stream.flush()
+    except (OSError, ValueError):
+        pass
+
+
+def diagnose(message):
+    # print(file=None) falls back to stdout. A closed stderr must not contaminate
+    # the JSON channel with a plain-text diagnostic.
+    if sys.stderr is None:
+        return
+    try:
+        sys.stderr.write("job-heartbeat: " + message + "\n")
+        sys.stderr.flush()
+    except (OSError, ValueError):
+        discard_failed_stream(sys.stderr)
+
+
+def emit(result):
+    try:
+        if sys.stdout is None:
+            raise OSError("stdout is unavailable")
+        sys.stdout.write(json.dumps(result, ensure_ascii=True, allow_nan=False, sort_keys=True) + "\n")
+        sys.stdout.flush()
+        return True
+    except (OSError, ValueError) as exc:
+        diagnose("cannot emit JSON receipt: " + str(exc))
+        discard_failed_stream(sys.stdout)
+        return False
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--version", action="version", version=VERSION)
+    parser.add_argument("--dir", dest="directory", required=True, help="explicit local storage directory")
+    parser.add_argument("--lock-timeout", type=nonnegative, default=5, help="seconds to wait for the storage lock (default 5)")
+    commands = parser.add_subparsers(dest="command", required=True)
+    start = commands.add_parser("start", help="start a new generation")
+    start.add_argument("job", type=job_name)
+    start.add_argument("--ttl", type=positive, default=60, help="heartbeat freshness window in seconds (default 60)")
+    start.add_argument("--replace", type=generation, help="compare and replace this exact existing generation")
+    start.add_argument("--note", type=note, default="")
+    for action in ("touch", "finish"):
+        command = commands.add_parser(action)
+        command.add_argument("job", type=job_name)
+        command.add_argument("generation", type=generation)
+        command.add_argument("--note", type=note)
+        if action == "finish":
+            command.add_argument("--outcome", choices=OUTCOMES, default="succeeded")
+    commands.add_parser("read").add_argument("job", type=job_name)
+    commands.add_parser("list")
+    args = parser.parse_args(argv)
+    if not args.directory:
+        parser.error("--dir must not be empty")
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(sig, interrupted)
+    # Reject an absent stdout before allocating storage or publishing a generation.
+    # Open-but-broken pipes can still fail after mutation; emit handles that case.
+    try:
+        if sys.stdout is None:
+            raise OSError("stdout is unavailable")
+        os.fstat(sys.stdout.fileno())
+    except (OSError, ValueError) as exc:
+        diagnose("cannot emit JSON receipt: " + str(exc))
+        discard_failed_stream(sys.stdout)
+        return 1
+    try:
+        result, code = operate(args)
+        return code if emit(result) else 1
+    except Refused as exc:
+        diagnose(str(exc))
+        return 3
+    except Busy as exc:
+        diagnose(str(exc))
+        return 75
+    except (OSError, ValueError, UnicodeError, RecursionError) as exc:
+        if args.command in ("read", "list"):
+            result = report(getattr(args, "job", None), None, time.time(), str(exc))
+            emit([result] if args.command == "list" else result)
+        diagnose(str(exc))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
