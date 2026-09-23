@@ -15,4 +15,4 @@ watcher rosters, automatic nudges, and environment-specific paths were omitted.
 Tests and examples use only newly generated synthetic state. No private runtime
 state or service credentials are included.
 
-Private candidate; Apache-2.0 licensed; public launch deferred. The owner selected Apache-2.0 on 2026-09-22; public launch remains deferred.
+Public reference implementation; Apache-2.0 licensed; deprecated for new Claude Code integrations as of 2026-09-22. The owner selected Apache-2.0 on 2026-09-22.
